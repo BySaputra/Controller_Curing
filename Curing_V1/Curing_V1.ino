@@ -149,6 +149,12 @@ unsigned long lastPidComputeMs = 0;    // Waktu kalkulasi PID terakhir (ms)
 const unsigned long PID_COMPUTE_INTERVAL_MS = 250; // Interval komputasi PID (250 ms)
 float pidPTerm = 0.0;                  // Komponen Proportional terakhir (untuk logging)
 float pidDTerm = 0.0;                  // Komponen Derivative terakhir (untuk logging)
+bool  pidIntegralActive = false;       // Flag: apakah integral sedang aktif (untuk logging I_ACTIVE)
+
+// Integral Active Zone: integral hanya berakumulasi saat |error| <= threshold.
+// Di luar zona (error > +threshold): integral dibekukan (tidak bertambah, tidak reset).
+// Saat overshoot (error < 0): integral tetap dapat unwind meski di luar zona.
+const float ACTIVE_ZONE_THRESHOLD = 5.0f; // Zona aktif integral: ±5.0 °C dari setpoint
 
 const unsigned long SSR_WINDOW_MS = 2000;   // Total window time 2000 ms (2 detik)
 unsigned long ssrWindowStartTime = 0;       // Waktu awal window SSR saat ini (ms)
@@ -558,16 +564,18 @@ void computePID() {
   // --- SAFETY GUARD ---
   // Jika kondisi tidak aman: reset semua state PID dan matikan output
   if (!systemRunning || !heaterAllowed || sensorError || currentSafetyState != SAFETY_OK) {
-    pidOutput       = 0.0;
-    pidIntegralTerm = 0.0;
-    pidPTerm        = 0.0;
-    pidDTerm        = 0.0;
-    lastPidComputeMs = now;
-    pidFirstRun     = true;
-    ssrWindowOnTimeMs = 0;
+    pidOutput          = 0.0;
+    pidIntegralTerm    = 0.0;
+    pidPTerm           = 0.0;
+    pidDTerm           = 0.0;
+    pidIntegralActive  = false;
+    lastPidComputeMs   = now;
+    pidFirstRun        = true;
+    ssrWindowOnTimeMs  = 0;
     heaterOutputPercent = 0.0;
     return;
   }
+
 
   // --- FIRST RUN INIT ---
   // Inisialisasi state PID saat pertama kali running (setelah START)
@@ -604,31 +612,63 @@ void computePID() {
   float dTerm  = -Kd * (dInput / dt);
   lastPidInput = currentTemperature;
 
-  // --- CANDIDATE INTEGRAL ---
-  // Hitung kandidat integral baru sebelum diputuskan apakah akan digunakan
-  float candidateIntegral = pidIntegralTerm + (Ki * error * dt);
+  // --- INTEGRAL ACTIVE ZONE + CONDITIONAL ANTI-WINDUP ---
+  //
+  // Tiga kondisi:
+  //
+  //  A. |error| <= ACTIVE_ZONE_THRESHOLD  → integral aktif normal
+  //     Hitung candidateIntegral, terapkan anti-windup berbasis unsaturatedOutput.
+  //
+  //  B. error < 0 (overshoot, di luar zona negatif)
+  //     → integral tetap boleh unwind.
+  //     Tidak ada anti-windup ke atas karena pTerm sudah negatif.
+  //     Clamp minimum ke 0 saja.
+  //
+  //  C. error > +ACTIVE_ZONE_THRESHOLD (suhu masih jauh di bawah setpoint)
+  //     → jangan akumulasi integral baru.
+  //     → pertahankan nilai pidIntegralTerm yang sudah ada (JANGAN reset ke 0).
 
-  // Clamp candidateIntegral ke batas aman [0, 100]
-  if (candidateIntegral > 100.0f) candidateIntegral = 100.0f;
-  if (candidateIntegral <   0.0f) candidateIntegral =   0.0f;
+  if (fabsf(error) <= ACTIVE_ZONE_THRESHOLD) {
+    // ---- KONDISI A: Di dalam active zone ----
+    // Integral aktif; terapkan conditional integration anti-windup.
+    pidIntegralActive = true;
 
-  // --- CONDITIONAL INTEGRATION (ANTI-WINDUP) ---
-  // Hitung unsaturated output menggunakan candidateIntegral
-  float unsaturatedOutput = pTerm + candidateIntegral + dTerm;
+    float candidateIntegral = pidIntegralTerm + (Ki * error * dt);
 
-  // Logika:
-  //   - Jika output akan saturasi KE ATAS (>100%) DAN error positif (suhu belum tercapai):
-  //     → BEKUKAN integral untuk mencegah windup ke atas
-  //   - Semua kondisi lain (termasuk error negatif saat overshoot):
-  //     → IZINKAN integral diupdate (termasuk BERKURANG saat error < 0)
-  //     → Ini memungkinkan integral melakukan unwind aktif saat overshoot
-  if (unsaturatedOutput > 100.0f && error > 0.0f) {
-    // Anti-windup: tahan integral agar tidak terus naik saat output saturasi atas
-    // pidIntegralTerm tidak diubah
-  } else {
-    // Normal update: integral dapat naik MAUPUN turun
-    // Ini yang memungkinkan unwind saat temperatur melewati setpoint
+    // Clamp candidateIntegral ke batas aman [0, 100]
+    if (candidateIntegral > 100.0f) candidateIntegral = 100.0f;
+    if (candidateIntegral <   0.0f) candidateIntegral =   0.0f;
+
+    // Hitung unsaturated output untuk evaluasi anti-windup
+    float unsaturatedOutput = pTerm + candidateIntegral + dTerm;
+
+    if (unsaturatedOutput > 100.0f && error > 0.0f) {
+      // Anti-windup: tahan integral saat output saturasi atas & error positif
+      // pidIntegralTerm tidak diubah
+    } else {
+      // Update normal: integral dapat naik atau turun (termasuk unwind)
+      pidIntegralTerm = candidateIntegral;
+    }
+
+  } else if (error < 0.0f) {
+    // ---- KONDISI B: Overshoot (suhu di atas setpoint, di luar zona) ----
+    // Integral tetap boleh turun/unwind agar bisa melepaskan energi tersimpan.
+    // Tidak diperlukan anti-windup ke atas karena error negatif → integral turun.
+    pidIntegralActive = false;
+
+    float candidateIntegral = pidIntegralTerm + (Ki * error * dt);
+
+    // Clamp hanya ke bawah 0; batas atas tidak diperlukan (error negatif → integral turun)
+    if (candidateIntegral < 0.0f) candidateIntegral = 0.0f;
+
     pidIntegralTerm = candidateIntegral;
+
+  } else {
+    // ---- KONDISI C: Suhu masih jauh di bawah setpoint (error > +threshold) ----
+    // Jangan akumulasi integral baru.
+    // Pertahankan nilai pidIntegralTerm yang sudah ada (jangan reset).
+    pidIntegralActive = false;
+    // pidIntegralTerm tidak diubah
   }
 
   // --- TOTAL OUTPUT ---
@@ -1886,7 +1926,7 @@ void logCSVData() {
     Serial.print(F(", KI=")); Serial.print(Ki, 2);
     Serial.print(F(", KD=")); Serial.print(Kd, 2);
     Serial.println();
-    Serial.println(F("TIME,TEMP,SETPOINT,ERROR,PID_OUTPUT,HEATER,SAFETY,P_TERM,I_TERM,D_TERM"));
+    Serial.println(F("TIME,TEMP,SETPOINT,ERROR,PID_OUTPUT,HEATER,SAFETY,P_TERM,I_TERM,D_TERM,I_ACTIVE"));
   }
 
   // 2. TRANSISI END SESSION (Keluar dari mode RUNNING)
@@ -1932,7 +1972,8 @@ void logCSVData() {
       Serial.print(safetyStr); Serial.print(F(","));
       Serial.print(pidPTerm, 3); Serial.print(F(","));
       Serial.print(pidIntegralTerm, 3); Serial.print(F(","));
-      Serial.println(pidDTerm, 3);
+      Serial.print(pidDTerm, 3); Serial.print(F(","));
+      Serial.println(pidIntegralActive ? 1 : 0);
     }
   }
 }
