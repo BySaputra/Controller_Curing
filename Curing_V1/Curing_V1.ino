@@ -4,7 +4,7 @@
   TARGET  : ESP32 DevKit / ESP32-WROOM-32 (Board: "ESP32 Dev Module")
   DISPLAY : OLED 0.96" 128x64 I2C (Adafruit SSD1306 + GFX)
   INPUT   : Rotary Encoder with Push Button
-  VERSION : 1.3.0
+  VERSION : 1.4.0
   ================================================================================
 */
 
@@ -147,6 +147,8 @@ float pidIntegralTerm = 0.0;           // Akumulasi komponen Integral
 float lastPidInput = 0.0;              // Temperatur terfilter sebelumnya untuk Derivative
 unsigned long lastPidComputeMs = 0;    // Waktu kalkulasi PID terakhir (ms)
 const unsigned long PID_COMPUTE_INTERVAL_MS = 250; // Interval komputasi PID (250 ms)
+float pidPTerm = 0.0;                  // Komponen Proportional terakhir (untuk logging)
+float pidDTerm = 0.0;                  // Komponen Derivative terakhir (untuk logging)
 
 const unsigned long SSR_WINDOW_MS = 2000;   // Total window time 2000 ms (2 detik)
 unsigned long ssrWindowStartTime = 0;       // Waktu awal window SSR saat ini (ms)
@@ -542,21 +544,6 @@ void readTemperatureSensor() {
       }
     }
   }
-
-  if (now - lastSerialDebugMs >= SERIAL_DEBUG_INTERVAL_MS) {
-    lastSerialDebugMs = now;
-    if (!sensorError) {
-      Serial.print(F("RAW: ")); Serial.print(rawTemperature, 2); Serial.print(F(" | "));
-      Serial.print(F("CAL: ")); Serial.print(calibratedTemperature, 2); Serial.print(F(" | "));
-      Serial.print(F("MEDIAN: ")); Serial.print(medianTemperature, 2); Serial.print(F(" | "));
-      Serial.print(F("FILTERED: ")); Serial.print(filteredTemperature, 2); Serial.print(F(" | "));
-      Serial.print(F("SP: ")); Serial.print(setpoint, 2); Serial.print(F(" | "));
-      Serial.print(F("PID: ")); Serial.print(pidOutput, 1); Serial.print(F("% | "));
-      Serial.println(F("Sensor: OK"));
-    } else {
-      Serial.println(F("RAW: INVALID | Sensor: ERROR | Thermocouple disconnected"));
-    }
-  }
 }
 
 // ================================================================
@@ -568,64 +555,106 @@ static bool pidFirstRun = true;
 void computePID() {
   unsigned long now = millis();
 
+  // --- SAFETY GUARD ---
+  // Jika kondisi tidak aman: reset semua state PID dan matikan output
   if (!systemRunning || !heaterAllowed || sensorError || currentSafetyState != SAFETY_OK) {
-    pidOutput = 0.0;
+    pidOutput       = 0.0;
     pidIntegralTerm = 0.0;
+    pidPTerm        = 0.0;
+    pidDTerm        = 0.0;
     lastPidComputeMs = now;
-    pidFirstRun = true;
+    pidFirstRun     = true;
     ssrWindowOnTimeMs = 0;
     heaterOutputPercent = 0.0;
     return;
   }
 
+  // --- FIRST RUN INIT ---
+  // Inisialisasi state PID saat pertama kali running (setelah START)
   if (pidFirstRun) {
-    lastPidInput = currentTemperature;
-    pidFirstRun = false;
+    lastPidInput     = currentTemperature;
+    pidFirstRun      = false;
     lastPidComputeMs = now;
     ssrWindowStartTime = now;
-    ssrWindowOnTimeMs = 0;
+    ssrWindowOnTimeMs  = 0;
+    return; // Skip komputasi pada first run, tunggu interval berikutnya
   }
 
-  if (now - lastPidComputeMs >= PID_COMPUTE_INTERVAL_MS) {
-    float dt = (now - lastPidComputeMs) / 1000.0;
-    lastPidComputeMs = now;
-
-    if (dt <= 0.0) dt = 0.2;
-
-    float error = setpoint - currentTemperature;
-    float pTerm = Kp * error;
-
-    float newIntegral = pidIntegralTerm + (Ki * error * dt);
-    if (newIntegral > 100.0) newIntegral = 100.0;
-    else if (newIntegral < 0.0) newIntegral = 0.0;
-
-    if ((pidOutput >= 100.0 && error > 0.0) || (pidOutput <= 0.0 && error < 0.0)) {
-      // Tahan akumulasi integral (Anti-Windup)
-    } else {
-      pidIntegralTerm = newIntegral;
-    }
-
-    float dInput = currentTemperature - lastPidInput;
-    float dTerm = -Kd * (dInput / dt);
-    lastPidInput = currentTemperature;
-
-    float totalOutput = pTerm + pidIntegralTerm + dTerm;
-
-    if (totalOutput > 100.0) {
-      pidOutput = 100.0;
-    } else if (totalOutput < 0.0) {
-      pidOutput = 0.0;
-    } else {
-      pidOutput = totalOutput;
-    }
-
-    heaterOutputPercent = pidOutput;
+  // --- PID COMPUTE INTERVAL CHECK ---
+  if (now - lastPidComputeMs < PID_COMPUTE_INTERVAL_MS) {
+    return;
   }
+
+  // --- HITUNG DT ---
+  float dt = (float)(now - lastPidComputeMs) / 1000.0f;
+  lastPidComputeMs = now;
+
+  // Batas dt minimum untuk mencegah pembagian nol atau dt abnormal
+  if (dt < 0.01f) dt = 0.01f;
+  if (dt > 2.0f)  dt = 2.0f;   // Batas atas: jika loop freeze > 2 detik, clamp dt
+
+  // --- HITUNG ERROR ---
+  float error = setpoint - currentTemperature;
+
+  // --- P TERM ---
+  float pTerm = Kp * error;
+
+  // --- D TERM (berbasis measurement, bukan error, untuk menghindari derivative kick) ---
+  float dInput = currentTemperature - lastPidInput;
+  float dTerm  = -Kd * (dInput / dt);
+  lastPidInput = currentTemperature;
+
+  // --- CANDIDATE INTEGRAL ---
+  // Hitung kandidat integral baru sebelum diputuskan apakah akan digunakan
+  float candidateIntegral = pidIntegralTerm + (Ki * error * dt);
+
+  // Clamp candidateIntegral ke batas aman [0, 100]
+  if (candidateIntegral > 100.0f) candidateIntegral = 100.0f;
+  if (candidateIntegral <   0.0f) candidateIntegral =   0.0f;
+
+  // --- CONDITIONAL INTEGRATION (ANTI-WINDUP) ---
+  // Hitung unsaturated output menggunakan candidateIntegral
+  float unsaturatedOutput = pTerm + candidateIntegral + dTerm;
+
+  // Logika:
+  //   - Jika output akan saturasi KE ATAS (>100%) DAN error positif (suhu belum tercapai):
+  //     → BEKUKAN integral untuk mencegah windup ke atas
+  //   - Semua kondisi lain (termasuk error negatif saat overshoot):
+  //     → IZINKAN integral diupdate (termasuk BERKURANG saat error < 0)
+  //     → Ini memungkinkan integral melakukan unwind aktif saat overshoot
+  if (unsaturatedOutput > 100.0f && error > 0.0f) {
+    // Anti-windup: tahan integral agar tidak terus naik saat output saturasi atas
+    // pidIntegralTerm tidak diubah
+  } else {
+    // Normal update: integral dapat naik MAUPUN turun
+    // Ini yang memungkinkan unwind saat temperatur melewati setpoint
+    pidIntegralTerm = candidateIntegral;
+  }
+
+  // --- TOTAL OUTPUT ---
+  float totalOutput = pTerm + pidIntegralTerm + dTerm;
+
+  // Clamp output ke 0..100%
+  if (totalOutput > 100.0f) {
+    pidOutput = 100.0f;
+  } else if (totalOutput < 0.0f) {
+    pidOutput = 0.0f;
+  } else {
+    pidOutput = totalOutput;
+  }
+
+  // --- SIMPAN UNTUK LOGGING ---
+  pidPTerm = pTerm;
+  pidDTerm = dTerm;
+
+  // --- UPDATE HEATER OUTPUT PERCENT ---
+  heaterOutputPercent = pidOutput;
 }
 
 // ================================================================
 // BLOCK 07 - ACTUATOR
 // ================================================================
+
 
 void emergencyPinsSafeState() {
   pinMode(SSR_HEATER_PIN, OUTPUT);
@@ -1118,6 +1147,10 @@ void handleStartInput(EncoderEvent event) {
         curingRemainingSeconds = curingTotalSeconds;
         pidOutput = 0.0;
         pidIntegralTerm = 0.0;
+        pidPTerm = 0.0;
+        pidDTerm = 0.0;
+        pidFirstRun = true;           // Pastikan branch init di computePID() aktif
+
         lastPidInput = currentTemperature;
         lastPidComputeMs = millis();
         ssrWindowStartTime = millis();
@@ -1807,7 +1840,7 @@ void showSystemVersionScreen() {
   display.print(F("OVEN CONTROLLER"));
 
   display.setCursor(0, 36);
-  display.print(F("FW VERSION: 1.3.0"));
+  display.print(F("FW VERSION: 1.4.0"));
 }
 
 void showSystemResetConfirmScreen() {
@@ -1839,21 +1872,68 @@ void showSystemResetConfirmScreen() {
 // ================================================================
 
 void logCSVData() {
-  unsigned long now = millis();
-  if (now - lastCsvLogMs >= CSV_LOG_INTERVAL_MS) {
-    lastCsvLogMs = now;
+  static bool lastRunningState = false;
 
-    unsigned long timeSeconds = now / 1000;
-    const char* safetyStr = "OK";
-    if (currentSafetyState == SAFETY_SENSOR_ERROR) safetyStr = "SENSOR_ERR";
-    else if (currentSafetyState == SAFETY_OVER_TEMP) safetyStr = "OVER_TEMP";
+  // 1. TRANSISI START SESSION (Masuk mode RUNNING)
+  if (systemRunning && !lastRunningState) {
+    lastRunningState = true;
+    lastCsvLogMs = millis();
 
-    Serial.print(timeSeconds); Serial.print(F(","));
-    Serial.print(currentTemperature, 1); Serial.print(F(","));
-    Serial.print(setpoint, 1); Serial.print(F(","));
-    Serial.print(pidOutput, 1); Serial.print(F(","));
-    Serial.print(heaterState ? 1 : 0); Serial.print(F(","));
-    Serial.println(safetyStr);
+    Serial.println();
+    Serial.println(F("=== PID RUN START ==="));
+    Serial.print(F("SETPOINT=")); Serial.print(setpoint, 2);
+    Serial.print(F(", KP=")); Serial.print(Kp, 2);
+    Serial.print(F(", KI=")); Serial.print(Ki, 2);
+    Serial.print(F(", KD=")); Serial.print(Kd, 2);
+    Serial.println();
+    Serial.println(F("TIME,TEMP,SETPOINT,ERROR,PID_OUTPUT,HEATER,SAFETY,P_TERM,I_TERM,D_TERM"));
+  }
+
+  // 2. TRANSISI END SESSION (Keluar dari mode RUNNING)
+  if (!systemRunning && lastRunningState) {
+    lastRunningState = false;
+
+    if (currentSafetyState == SAFETY_SENSOR_ERROR) {
+      Serial.println(F("SAFETY_FAULT,SENSOR_ERROR"));
+    } else if (currentSafetyState == SAFETY_OVER_TEMP) {
+      Serial.println(F("SAFETY_FAULT,OVER_TEMP"));
+    }
+
+    Serial.println(F("=== PID RUN END ==="));
+    Serial.println();
+    return;
+  }
+
+  // 3. PERIODIC DATA LOGGING (Setiap 1000 ms hanya saat RUNNING)
+  if (systemRunning) {
+    unsigned long now = millis();
+    if (now - lastCsvLogMs >= CSV_LOG_INTERVAL_MS) {
+      lastCsvLogMs = now;
+
+      unsigned long elapsedSec = (now - curingStartTime) / 1000;
+      unsigned long hrs = elapsedSec / 3600;
+      unsigned long mins = (elapsedSec % 3600) / 60;
+      unsigned long secs = elapsedSec % 60;
+      char timeBuf[12];
+      snprintf(timeBuf, sizeof(timeBuf), "%02lu:%02lu:%02lu", hrs, mins, secs);
+
+      float errorVal = setpoint - currentTemperature;
+
+      const char* safetyStr = "OK";
+      if (currentSafetyState == SAFETY_SENSOR_ERROR) safetyStr = "SENSOR_ERROR";
+      else if (currentSafetyState == SAFETY_OVER_TEMP) safetyStr = "OVER_TEMP";
+
+      Serial.print(timeBuf); Serial.print(F(","));
+      Serial.print(currentTemperature, 2); Serial.print(F(","));
+      Serial.print(setpoint, 2); Serial.print(F(","));
+      Serial.print(errorVal, 2); Serial.print(F(","));
+      Serial.print(pidOutput, 2); Serial.print(F(","));
+      Serial.print(heaterState ? F("ON") : F("OFF")); Serial.print(F(","));
+      Serial.print(safetyStr); Serial.print(F(","));
+      Serial.print(pidPTerm, 3); Serial.print(F(","));
+      Serial.print(pidIntegralTerm, 3); Serial.print(F(","));
+      Serial.println(pidDTerm, 3);
+    }
   }
 }
 
@@ -1893,7 +1973,22 @@ void setup() {
   setupMAX6675();
   setupBuzzer();
   loadSettings();
+
+  // --- STARTUP LOG: Tampilkan PID settings yang diload dari NVS ---
+  Serial.println();
+  Serial.println(F("=== OVEN CURING CONTROLLER BOOT ==="));
+  Serial.println(F("PID SETTINGS (loaded from NVS):"));
+  Serial.print(F("  Kp = ")); Serial.println(Kp, 4);
+  Serial.print(F("  Ki = ")); Serial.println(Ki, 4);
+  Serial.print(F("  Kd = ")); Serial.println(Kd, 4);
+  Serial.print(F("  Setpoint = ")); Serial.print(setpoint, 2); Serial.println(F(" C"));
+  Serial.print(F("  SSR Window = ")); Serial.print(SSR_WINDOW_MS); Serial.println(F(" ms"));
+  Serial.print(F("  PID Interval = ")); Serial.print(PID_COMPUTE_INTERVAL_MS); Serial.println(F(" ms"));
+  Serial.println(F("==================================="));
+  Serial.println();
+
   checkSafetySystem();
+
 
   bootStartTime = millis();
   currentScreen = SCREEN_BOOT;
