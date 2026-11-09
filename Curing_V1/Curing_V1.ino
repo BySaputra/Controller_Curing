@@ -1,12 +1,4 @@
-/*
-  ================================================================================
-  PROJECT : OVEN CURING CONTROLLER - FULL FIRMWARE (UI + CONTROL + SAFETY)
-  TARGET  : ESP32 DevKit / ESP32-WROOM-32 (Board: "ESP32 Dev Module")
-  DISPLAY : OLED 0.96" 128x64 I2C (Adafruit SSD1306 + GFX)
-  INPUT   : Rotary Encoder with Push Button
-  VERSION : 1.3.0
-  ================================================================================
-*/
+
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -135,11 +127,9 @@ int medianBufferIndex = 0;
 int medianBufferCount = 0;
 
 const unsigned long SENSOR_READ_INTERVAL_MS = 250;  // Interval pembacaan sensor non-blocking (250 ms)
-const unsigned long SERIAL_DEBUG_INTERVAL_MS = 1000; // Interval log serial debugging (1000 ms)
 const float EMA_ALPHA = 0.20;                        // Faktor smoothing Exponential Moving Average (0.20)
 
 unsigned long lastSensorReadMs = 0;
-unsigned long lastSerialDebugMs = 0;
 
 // PID Controller & Time-Proportional Control Variables
 float pidOutput = 0.0;                 // Output PID 0.0 - 100.0 %
@@ -147,10 +137,17 @@ float pidIntegralTerm = 0.0;           // Akumulasi komponen Integral
 float lastPidInput = 0.0;              // Temperatur terfilter sebelumnya untuk Derivative
 unsigned long lastPidComputeMs = 0;    // Waktu kalkulasi PID terakhir (ms)
 const unsigned long PID_COMPUTE_INTERVAL_MS = 250; // Interval komputasi PID (250 ms)
+float pidPTerm = 0.0;                  // Komponen Proportional terakhir (untuk logging)
+float pidDTerm = 0.0;                  // Komponen Derivative terakhir (untuk logging)
+bool  pidIntegralActive = false;       // Flag: apakah integral sedang aktif (untuk logging)
+bool  pidFirstRun = true;              // Flag inisialisasi first-run PID (global)
+
+// Anti-Windup: Conditional Integration (Clamping) pada batas saturasi 0-100%.
+// Integral BOLEH unwind (turun) saat overshoot — tidak diblokir oleh zona aktif kaku.
 
 const unsigned long SSR_WINDOW_MS = 2000;   // Total window time 2000 ms (2 detik)
 unsigned long ssrWindowStartTime = 0;       // Waktu awal window SSR saat ini (ms)
-unsigned long ssrWindowOnTimeMs = 0;        // ON-time untuk window SAAT INI, di-snapshot sekali per window
+unsigned long ssrWindowOnTimeMs = 0;        // ON-time yang diaplikasikan pada window SAAT INI
 
 const unsigned long CSV_LOG_INTERVAL_MS = 1000; // Interval logging CSV 1000 ms (1 detik)
 unsigned long lastCsvLogMs = 0;
@@ -160,8 +157,8 @@ float setpoint = 60.0;           // Default setpoint (°C)
 const float SETPOINT_MIN = 30.0; // Batas minimum setpoint (°C)
 const float SETPOINT_MAX = 120.0;// Batas maksimum setpoint (°C)
 
-float Kp = 2.50;                 // Parameter PID - Proportional (Konservatif awal)
-float Ki = 0.50;                 // Parameter PID - Integral (Konservatif awal)
+float Kp = 1.50;                 // Parameter PID - Proportional (Konservatif awal)
+float Ki = 0.075;                 // Parameter PID - Integral (Konservatif awal)
 float Kd = 1.00;                 // Parameter PID - Derivative (Konservatif awal)
 
 bool heaterManual = false;       // Manual flag heater
@@ -294,8 +291,8 @@ void loadSettings() {
   preferences.begin("oven", false);
   setpoint = preferences.getFloat("setpoint", 60.0);
   timerDurationMinutes = preferences.getUInt("timer_dur", 30);
-  Kp = preferences.getFloat("pid_kp", 2.50);
-  Ki = preferences.getFloat("pid_ki", 0.50);
+  Kp = preferences.getFloat("pid_kp", 1.50);
+  Ki = preferences.getFloat("pid_ki", 0.075);
   Kd = preferences.getFloat("pid_kd", 1.00);
   calibrationOffset = preferences.getFloat("cal_offset", 0.0);
   preferences.end();
@@ -341,11 +338,37 @@ void saveTimer() {
 void resetSettings() {
   setpoint = 60.0;
   timerDurationMinutes = 30;
-  Kp = 1.00;
-  Ki = 0.00;
-  Kd = 0.00;
+  Kp = 1.50;
+  Ki = 0.075;
+  Kd = 1.00;
   calibrationOffset = 0.0;
   saveSettings();
+
+  if (systemRunning) {
+    pidIntegralTerm   = 0.0f;
+    pidIntegralActive = false;
+    lastPidInput      = currentTemperature;
+    lastPidComputeMs  = millis();
+    pidFirstRun       = false;
+
+    float err = setpoint - currentTemperature;
+    pidPTerm = Kp * err;
+    pidDTerm = 0.0f;
+    float total = pidPTerm + pidIntegralTerm + pidDTerm;
+
+    if (total > 100.0f)      pidOutput = 100.0f;
+    else if (total < 0.0f)   pidOutput = 0.0f;
+    else                     pidOutput = total;
+
+    heaterOutputPercent = pidOutput;
+    ssrWindowStartTime  = millis();
+    if (pidOutput <= 0.0f) {
+      ssrWindowOnTimeMs = 0;
+      setHeater(false);
+    } else {
+      ssrWindowOnTimeMs = (unsigned long)((pidOutput / 100.0f) * (float)SSR_WINDOW_MS);
+    }
+  }
 }
 
 // ================================================================
@@ -482,7 +505,9 @@ void readTemperatureSensor() {
 
     uint16_t rawData = readMAX6675Raw();
 
-    if ((rawData & 0x04) || rawData == 0xFFFF || rawData == 0x0000) {
+    // Deteksi thermocouple terputus (Bit 2 == 1) atau jalur data bus floating (0xFFFF).
+    // Nilai 0x0000 diizinkan karena merupakan pembacaan valid untuk temperatur 0 °C.
+    if ((rawData & 0x04) || rawData == 0xFFFF) {
       sensorError = true;
       sensorOkStreak = 0;
       filterInitialized = false;
@@ -542,90 +567,147 @@ void readTemperatureSensor() {
       }
     }
   }
-
-  if (now - lastSerialDebugMs >= SERIAL_DEBUG_INTERVAL_MS) {
-    lastSerialDebugMs = now;
-    if (!sensorError) {
-      Serial.print(F("RAW: ")); Serial.print(rawTemperature, 2); Serial.print(F(" | "));
-      Serial.print(F("CAL: ")); Serial.print(calibratedTemperature, 2); Serial.print(F(" | "));
-      Serial.print(F("MEDIAN: ")); Serial.print(medianTemperature, 2); Serial.print(F(" | "));
-      Serial.print(F("FILTERED: ")); Serial.print(filteredTemperature, 2); Serial.print(F(" | "));
-      Serial.print(F("SP: ")); Serial.print(setpoint, 2); Serial.print(F(" | "));
-      Serial.print(F("PID: ")); Serial.print(pidOutput, 1); Serial.print(F("% | "));
-      Serial.println(F("Sensor: OK"));
-    } else {
-      Serial.println(F("RAW: INVALID | Sensor: ERROR | Thermocouple disconnected"));
-    }
-  }
 }
 
 // ================================================================
 // BLOCK 06 - PID
 // ================================================================
 
-static bool pidFirstRun = true;
-
 void computePID() {
   unsigned long now = millis();
 
+  // --- SAFETY GUARD ---
+  // Jika kondisi tidak aman: reset semua state PID dan matikan output
   if (!systemRunning || !heaterAllowed || sensorError || currentSafetyState != SAFETY_OK) {
-    pidOutput = 0.0;
-    pidIntegralTerm = 0.0;
-    lastPidComputeMs = now;
-    pidFirstRun = true;
-    ssrWindowOnTimeMs = 0;
-    heaterOutputPercent = 0.0;
+    pidOutput           = 0.0f;
+    pidIntegralTerm     = 0.0f;
+    pidPTerm            = 0.0f;
+    pidDTerm            = 0.0f;
+    pidIntegralActive   = false;
+    lastPidComputeMs    = now;
+    pidFirstRun         = true;
+    ssrWindowOnTimeMs   = 0;
+    heaterOutputPercent = 0.0f;
     return;
   }
 
+  // --- FIRST RUN INIT: HANYA inisialisasi state, TIDAK komputasi output ---
+  //
+  // FIX v1.4.2: Versi lama menjalankan komputasi PID penuh di siklus pertama
+  // dengan dt nominal 0.25s. Ini menyebabkan D-Term spike besar karena
+  // dInput = currentTemperature - lastPidInput (lastPidInput = 0.0 sebelum init),
+  // menghasilkan lonjakan output positif besar di siklus pertama.
+  //
+  // FIX: Gunakan first run HANYA untuk inisialisasi state.
+  // Output tetap 0 dan SSR tetap OFF sampai siklus komputasi berikutnya.
   if (pidFirstRun) {
-    lastPidInput = currentTemperature;
-    pidFirstRun = false;
-    lastPidComputeMs = now;
+    lastPidInput       = currentTemperature;
+    lastPidComputeMs   = now;
     ssrWindowStartTime = now;
-    ssrWindowOnTimeMs = 0;
+    ssrWindowOnTimeMs  = 0;
+    pidFirstRun        = false;
+    return;
   }
 
-  if (now - lastPidComputeMs >= PID_COMPUTE_INTERVAL_MS) {
-    float dt = (now - lastPidComputeMs) / 1000.0;
-    lastPidComputeMs = now;
-
-    if (dt <= 0.0) dt = 0.2;
-
-    float error = setpoint - currentTemperature;
-    float pTerm = Kp * error;
-
-    float newIntegral = pidIntegralTerm + (Ki * error * dt);
-    if (newIntegral > 100.0) newIntegral = 100.0;
-    else if (newIntegral < 0.0) newIntegral = 0.0;
-
-    if ((pidOutput >= 100.0 && error > 0.0) || (pidOutput <= 0.0 && error < 0.0)) {
-      // Tahan akumulasi integral (Anti-Windup)
-    } else {
-      pidIntegralTerm = newIntegral;
-    }
-
-    float dInput = currentTemperature - lastPidInput;
-    float dTerm = -Kd * (dInput / dt);
-    lastPidInput = currentTemperature;
-
-    float totalOutput = pTerm + pidIntegralTerm + dTerm;
-
-    if (totalOutput > 100.0) {
-      pidOutput = 100.0;
-    } else if (totalOutput < 0.0) {
-      pidOutput = 0.0;
-    } else {
-      pidOutput = totalOutput;
-    }
-
-    heaterOutputPercent = pidOutput;
+  // --- PID INTERVAL CHECK ---
+  if (now - lastPidComputeMs < PID_COMPUTE_INTERVAL_MS) {
+    return;
   }
+
+  float dt = (float)(now - lastPidComputeMs) / 1000.0f;
+  lastPidComputeMs = now;
+
+  // Batas dt minimum & maksimum untuk stabilitas numerik
+  if (dt < 0.01f) dt = 0.01f;
+  if (dt > 2.0f)  dt = 2.0f;
+
+  // --- 1. HITUNG ERROR (setpoint - PV) ---
+  // Positif = suhu di bawah setpoint (perlu pemanasan)
+  // Negatif = overshoot (suhu di atas setpoint)
+  float error = setpoint - currentTemperature;
+
+  // --- 2. P-TERM ---
+  float pTerm = Kp * error;
+
+  // --- 3. D-TERM (Derivative on Measurement) ---
+  // Menggunakan -d(PV)/dt untuk menghindari derivative kick saat setpoint diubah
+  float dInput = currentTemperature - lastPidInput;
+  float dTerm = 0.0f;
+  if (dt > 0.001f) {
+    dTerm = -Kd * (dInput / dt);
+  }
+  lastPidInput = currentTemperature;
+
+  // Clamp dTerm untuk meredam lonjakan akibat noise sensor sesaat
+  if (dTerm >  50.0f) dTerm =  50.0f;
+  if (dTerm < -50.0f) dTerm = -50.0f;
+
+  // --- 4. CONDITIONAL INTEGRATION / CLAMPING ANTI-WINDUP ---
+  //
+  // FIX v1.4.2: Bug kritis pada versi sebelumnya:
+  // rawOutput dievaluasi menggunakan pidIntegralTerm LAMA (sebelum di-update).
+  // Skenario overshoot: T=70C, error=-10, pidIntegralTerm=20 (dari sesi sebelum overshoot)
+  //   rawOutput = pTerm(-10) + 20 + dTerm(~0) = ~10 (dalam range linier 0-100!)
+  //   Karena rawOutput > 0 dan error < 0:
+  //     Kondisi "rawOutput >= 100 && error > 0" -> false
+  //     Kondisi "rawOutput <= 0 && error < 0"   -> false (karena rawOutput=10, bukan <= 0)
+  //   allowIntegration = true -> integral bertambah lagi (meskipun sedang overshoot)!
+  //   Ini menyebabkan SSR tetap ON saat T sudah di atas setpoint.
+  //
+  // FIX: Hitung candidateIntegral terlebih dahulu, lalu evaluasi candidateOutput.
+  // Anti-windup dievaluasi berdasarkan output KANDIDAT yang sudah mencerminkan
+  // delta integral baru, sehingga unwind bisa terjadi secara konsisten.
+
+  float candidateIntegral = pidIntegralTerm + (Ki * error * dt);
+
+  // Clamp kandidat integral ke batas fisik [0, 100]% (heater unidirectional)
+  if (candidateIntegral > 100.0f) candidateIntegral = 100.0f;
+  if (candidateIntegral <   0.0f) candidateIntegral = 0.0f;
+
+  // Evaluasi output menggunakan integral KANDIDAT
+  float candidateOutput = pTerm + candidateIntegral + dTerm;
+
+  // Aturan Anti-Windup (Conditional Integration):
+  // - Blokir akumulasi integral HANYA saat output saturasi atas (>= 100%) DAN error > 0 (mencegah windup pemanasan).
+  // - Saat error negatif (overshoot), integral SELALU diizinkan melakukan unwind (turun)
+  //   tanpa diblokir oleh batas bawah output (batas minimum integral dijamin aman oleh clamping ke 0.0f).
+  bool allowIntegration = true;
+  if (candidateOutput >= 100.0f && error > 0.0f) {
+    allowIntegration = false;
+  }
+
+  if (allowIntegration) {
+    pidIntegralTerm   = candidateIntegral;
+    pidIntegralActive = (Ki > 0.0f && fabsf(error) > 0.01f);
+  } else {
+    pidIntegralActive = false;
+    // pidIntegralTerm tidak diubah saat diblokir oleh anti-windup saturasi atas
+  }
+
+  // --- 5. TOTAL OUTPUT & SATURASI AKHIR ---
+  float totalOutput = pTerm + pidIntegralTerm + dTerm;
+
+  if (totalOutput > 100.0f) {
+    pidOutput = 100.0f;
+  } else if (totalOutput < 0.0f) {
+    pidOutput = 0.0f;
+  } else {
+    pidOutput = totalOutput;
+  }
+
+  // --- 6. SIMPAN DATA LOGGING & AKTUALISASI heaterOutputPercent ---
+  pidPTerm = pTerm;
+  pidDTerm = dTerm;
+  heaterOutputPercent = pidOutput;
+
+  // Catatan: ssrWindowOnTimeMs di-update di updateOutputs() pada awal setiap
+  // window baru, menggunakan pidOutput terkini pada saat window berganti.
 }
 
 // ================================================================
 // BLOCK 07 - ACTUATOR
 // ================================================================
+
 
 void emergencyPinsSafeState() {
   pinMode(SSR_HEATER_PIN, OUTPUT);
@@ -641,19 +723,21 @@ void setHeater(bool state) {
 
     if (!heaterAllowed || sensorError || currentSafetyState != SAFETY_OK || (!systemRunning && !manualModeActive)) {
       heaterState = false;
-      heaterManual = false;
+      if (!systemRunning) {
+        heaterManual = false;
+        heaterOutputPercent = 0.0f;
+      }
       digitalWrite(SSR_HEATER_PIN, LOW);
-      heaterOutputPercent = 0.0;
       return;
     }
   }
 
   heaterState = state;
-  heaterManual = state;
-  digitalWrite(SSR_HEATER_PIN, state ? HIGH : LOW);
   if (!systemRunning) {
-    heaterOutputPercent = state ? 100.0 : 0.0;
+    heaterManual = state;
+    heaterOutputPercent = state ? 100.0f : 0.0f;
   }
+  digitalWrite(SSR_HEATER_PIN, state ? HIGH : LOW);
 }
 
 void setFan(bool state) {
@@ -732,20 +816,47 @@ void checkSafetySystem() {
 void updateOutputs() {
   unsigned long now = millis();
 
-  if (!heaterAllowed) {
+  // Jika sistem tidak aman, paksa heater OFF tanpa syarat
+  if (!heaterAllowed || sensorError || currentSafetyState != SAFETY_OK) {
     setHeater(false);
-  } else if (systemRunning) {
+    return;
+  }
+
+  if (systemRunning) {
+    // --- EVALUASI INSTANT SHUTOFF JIKA PID OUTPUT 0% ---
+    // Pastikan PID Output 0% langsung mematikan SSR seketika,
+    // tanpa menunggu sisa SSR window yang sedang berjalan.
+    if (pidOutput <= 0.0f) {
+      ssrWindowOnTimeMs = 0;
+      setHeater(false);
+      return;
+    }
+
+    // --- SSR TIME-PROPORTIONAL CONTROL (UNTUK OUTPUT > 0%) ---
+    // Snapshot on-time baru saat window berganti
     if (now - ssrWindowStartTime >= SSR_WINDOW_MS) {
       ssrWindowStartTime = now;
-      ssrWindowOnTimeMs = (unsigned long)((pidOutput / 100.0) * SSR_WINDOW_MS);
+      ssrWindowOnTimeMs  = (unsigned long)((pidOutput / 100.0f) * (float)SSR_WINDOW_MS);
     }
 
     unsigned long windowElapsed = now - ssrWindowStartTime;
-    setHeater(windowElapsed < ssrWindowOnTimeMs && ssrWindowOnTimeMs > 0);
-  }
 
-  if (!systemRunning && currentScreen != SCREEN_MANUAL_MENU && currentScreen != SCREEN_MANUAL_HEATER && currentScreen != SCREEN_MANUAL_FAN && heaterState) {
-    setHeater(false);
+    // Untuk output 100%: selalu ON sepanjang window
+    if (ssrWindowOnTimeMs >= SSR_WINDOW_MS) {
+      setHeater(true);
+    } else {
+      // Time-proportional normal untuk 0% < output < 100%
+      setHeater(windowElapsed < ssrWindowOnTimeMs);
+    }
+
+  } else {
+    // Sistem tidak running: heater OFF kecuali mode manual aktif
+    bool manualModeActive = (currentScreen == SCREEN_MANUAL_MENU ||
+                             currentScreen == SCREEN_MANUAL_HEATER ||
+                             currentScreen == SCREEN_MANUAL_FAN);
+    if (!manualModeActive && heaterState) {
+      setHeater(false);
+    }
   }
 }
 
@@ -1118,6 +1229,10 @@ void handleStartInput(EncoderEvent event) {
         curingRemainingSeconds = curingTotalSeconds;
         pidOutput = 0.0;
         pidIntegralTerm = 0.0;
+        pidPTerm = 0.0;
+        pidDTerm = 0.0;
+        pidFirstRun = true;           // Pastikan branch init di computePID() aktif
+
         lastPidInput = currentTemperature;
         lastPidComputeMs = millis();
         ssrWindowStartTime = millis();
@@ -1126,8 +1241,14 @@ void handleStartInput(EncoderEvent event) {
         triggerBuzzer(BUZZER_START);
         currentScreen = SCREEN_RUNNING;
       } else {
-        pidOutput = 0.0;
-        pidIntegralTerm = 0.0;
+        pidOutput = 0.0f;
+        pidIntegralTerm = 0.0f;
+        pidPTerm = 0.0f;
+        pidDTerm = 0.0f;
+        pidIntegralActive = false;
+        pidFirstRun = true;
+        ssrWindowOnTimeMs = 0;
+        heaterOutputPercent = 0.0f;
         setHeater(false);
         setFan(false);
         currentScreen = SCREEN_HOME;
@@ -1236,6 +1357,9 @@ void handleEncoderEvent(EncoderEvent event) {
           if (selectedPIDParam == 0) tempPIDValue = Kp;
           else if (selectedPIDParam == 1) tempPIDValue = Ki;
           else if (selectedPIDParam == 2) tempPIDValue = Kd;
+          // Snap nilai ke grid 0.05 sebelum masuk edit,
+          // agar nilai dari NVS yang mengandung float-drift langsung bersih.
+          tempPIDValue = roundf(tempPIDValue / 0.05f) * 0.05f;
           currentScreen = SCREEN_PID_EDIT;
         }
       }
@@ -1243,13 +1367,18 @@ void handleEncoderEvent(EncoderEvent event) {
 
     case SCREEN_PID_EDIT:
       {
-        float step = (selectedPIDParam == 1) ? 0.05 : 0.10;
+        // Semua parameter (Kp, Ki, Kd) menggunakan step 0.05.
+        // Setelah setiap operasi, nilai di-snap ke kelipatan 0.05
+        // menggunakan roundf() untuk menghindari floating-point drift.
+        const float PID_STEP = 0.05f;
         if (event == ENCODER_CW) {
-          tempPIDValue += step;
-          if (tempPIDValue > 99.9) tempPIDValue = 99.9;
+          tempPIDValue += PID_STEP;
+          tempPIDValue = roundf(tempPIDValue / PID_STEP) * PID_STEP;
+          if (tempPIDValue > 99.95f) tempPIDValue = 99.95f;
         } else if (event == ENCODER_CCW) {
-          tempPIDValue -= step;
-          if (tempPIDValue < 0.0) tempPIDValue = 0.0;
+          tempPIDValue -= PID_STEP;
+          tempPIDValue = roundf(tempPIDValue / PID_STEP) * PID_STEP;
+          if (tempPIDValue < 0.0f) tempPIDValue = 0.0f;
         } else if (event == ENCODER_PRESS) {
           if (selectedPIDParam == 0) Kp = tempPIDValue;
           else if (selectedPIDParam == 1) Ki = tempPIDValue;
@@ -1257,6 +1386,34 @@ void handleEncoderEvent(EncoderEvent event) {
 
           savePID();
           triggerBuzzer(BUZZER_SAVE);
+
+          // Sinkronisasi PID & re-inisialisasi state seketika setelah perubahan parameter:
+          // Pastikan output lama tidak terus digunakan dan hitung ulang output PID dengan parameter baru.
+          if (systemRunning) {
+            pidIntegralTerm   = 0.0f;
+            pidIntegralActive = false;
+            lastPidInput      = currentTemperature;
+            lastPidComputeMs  = millis();
+            pidFirstRun       = false;
+
+            float err = setpoint - currentTemperature;
+            pidPTerm = Kp * err;
+            pidDTerm = 0.0f; // Reset D-Term agar tidak spike akibat perubahan Kd
+            float total = pidPTerm + pidIntegralTerm + pidDTerm;
+
+            if (total > 100.0f)      pidOutput = 100.0f;
+            else if (total < 0.0f)   pidOutput = 0.0f;
+            else                     pidOutput = total;
+
+            heaterOutputPercent = pidOutput;
+            ssrWindowStartTime  = millis();
+            if (pidOutput <= 0.0f) {
+              ssrWindowOnTimeMs = 0;
+              setHeater(false);
+            } else {
+              ssrWindowOnTimeMs = (unsigned long)((pidOutput / 100.0f) * (float)SSR_WINDOW_MS);
+            }
+          }
           currentScreen = SCREEN_PID_MENU;
         }
       }
@@ -1438,7 +1595,7 @@ void showBootScreen() {
   display.print(F("CONTROLLER"));
 
   display.setCursor(44, 38);
-  display.print(F("v1.2.0"));
+  display.print(F("v1.4.2"));
 
   display.setCursor(28, 50);
   display.print(F("STARTING..."));
@@ -1807,7 +1964,7 @@ void showSystemVersionScreen() {
   display.print(F("OVEN CONTROLLER"));
 
   display.setCursor(0, 36);
-  display.print(F("FW VERSION: 1.3.0"));
+  display.print(F("FW VERSION: 1.4.2"));
 }
 
 void showSystemResetConfirmScreen() {
@@ -1838,24 +1995,87 @@ void showSystemResetConfirmScreen() {
 // BLOCK 13 - LOGGER
 // ================================================================
 
+
 void logCSVData() {
+  static unsigned long lastLogTime = 0;
+  static bool wasRunning = false;
+
+  // Reset waktu ketika proses curing baru dimulai
+  // Inisialisasi lastLogTime agar sampel t=0.0 langsung terkirim pada iterasi pertama
+  if (systemRunning && !wasRunning) {
+    wasRunning = true;
+    lastLogTime = millis() - CSV_LOG_INTERVAL_MS;
+  }
+
+  // Berhenti logging ketika curing selesai
+  if (!systemRunning) {
+    wasRunning = false;
+    return;
+  }
+
   unsigned long now = millis();
-  if (now - lastCsvLogMs >= CSV_LOG_INTERVAL_MS) {
-    lastCsvLogMs = now;
 
-    unsigned long timeSeconds = now / 1000;
-    const char* safetyStr = "OK";
-    if (currentSafetyState == SAFETY_SENSOR_ERROR) safetyStr = "SENSOR_ERR";
-    else if (currentSafetyState == SAFETY_OVER_TEMP) safetyStr = "OVER_TEMP";
+  // Logging periodik setiap 1000 ms (1 detik)
+  if (now - lastLogTime >= CSV_LOG_INTERVAL_MS) {
+    lastLogTime = now;
 
-    Serial.print(timeSeconds); Serial.print(F(","));
-    Serial.print(currentTemperature, 1); Serial.print(F(","));
-    Serial.print(setpoint, 1); Serial.print(F(","));
-    Serial.print(pidOutput, 1); Serial.print(F(","));
-    Serial.print(heaterState ? 1 : 0); Serial.print(F(","));
-    Serial.println(safetyStr);
+    float error = setpoint - currentTemperature;
+    float timeSeconds = (now - curingStartTime) / 1000.0f;
+
+    // 1. Waktu pengujian (detik)
+    Serial.print(timeSeconds, 1);
+    Serial.print(",");
+
+    // 2. Temperatur aktual
+    Serial.print(currentTemperature, 2);
+    Serial.print(",");
+
+    // 3. Setpoint
+    Serial.print(setpoint, 2);
+    Serial.print(",");
+
+    // 4. Error (setpoint - currentTemperature)
+    Serial.print(error, 2);
+    Serial.print(",");
+
+    // 5. P-Term
+    Serial.print(pidPTerm, 2);
+    Serial.print(",");
+
+    // 6. I-Term (akumulasi integral)
+    Serial.print(pidIntegralTerm, 2);
+    Serial.print(",");
+
+    // 7. D-Term
+    Serial.print(pidDTerm, 2);
+    Serial.print(",");
+
+    // 8. PID Output (0.00 - 100.00 %) — output SETELAH saturasi
+    Serial.print(pidOutput, 2);
+    Serial.print(",");
+
+    // 9. Kp (nilai aktif, untuk verifikasi bahwa NVS sudah benar)
+    Serial.print(Kp, 3);
+    Serial.print(",");
+
+    // 10. Ki
+    Serial.print(Ki, 3);
+    Serial.print(",");
+
+    // 11. Kd
+    Serial.print(Kd, 3);
+    Serial.print(",");
+
+    // 12. SSR ON-Time (ms) pada window saat ini
+    Serial.print(ssrWindowOnTimeMs);
+    Serial.print(",");
+
+    // 13. Heater State (1 = ON, 0 = OFF) — status GPIO SSR aktual
+    Serial.println(heaterState ? 1 : 0);
   }
 }
+
+
 
 // ================================================================
 // BLOCK 14 - INITIALIZATION
@@ -1877,7 +2097,6 @@ void setup() {
   Wire.begin(OLED_SDA, OLED_SCL);
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
-    Serial.println(F("OLED SSD1306 Inisialisasi Gagal!"));
     for (;;) {
       esp_task_wdt_reset();
       yield();
@@ -1893,6 +2112,7 @@ void setup() {
   setupMAX6675();
   setupBuzzer();
   loadSettings();
+
   checkSafetySystem();
 
   bootStartTime = millis();
